@@ -122,21 +122,38 @@ class CMUMotionDataset(Dataset):
         return f"{param_str}"
     
     def _compute_statistics(self, motion_data: Dict) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute mean and standard deviation of (which) joint positions"""
-        
-        # TODO: Compute the normalization statistics on the necessary part of motion data.
-        # Save the mean and std to self.mean and self.std.
-        
-        self.mean_pose = np.zeros_like(motion_data[list(motion_data.keys())[0]]['positions'][0])
-        self.std = np.zeros_like(motion_data[list(motion_data.keys())[0]]['positions'][0])
-        
-        # You can also save a copy of the mean and std for later use.
-        # stats = {
-        #     "mean_pose": self.mean_pose,
-        #     "std": self.std
-        # }
-        # with open(os.path.join(self.cache_dir, f"stats_{self.cache_id}.pkl"), 'wb') as f:
-        #     pickle.dump(stats, f)
+        """
+        Compute mean and std over *local_positions* across the entire dataset.
+        Result shapes: [J, 3] so they broadcast cleanly to [T, J, 3].
+        """
+        # Make sure we have at least one sequence
+        first_key = next(iter(motion_data))
+        J3_shape = motion_data[first_key]["local_positions"].shape[1:]  # [J, 3]
+
+        # Streaming accumulators (float64 for stability)
+        sum_x  = np.zeros(J3_shape, dtype=np.float64)
+        sum_x2 = np.zeros(J3_shape, dtype=np.float64)
+        N = 0  # total number of frames
+
+        for data in motion_data.values():
+            X = data["local_positions"]      # [T, J, 3] (numpy)
+            # Accumulate across time dimension
+            sum_x  += X.sum(axis=0)          # -> [J, 3]
+            sum_x2 += (X * X).sum(axis=0)    # -> [J, 3]
+            N += X.shape[0]
+
+        mean = (sum_x / max(N, 1)).astype(np.float32)
+        var  = (sum_x2 / max(N, 1)) - (mean.astype(np.float64) ** 2)
+        std  = np.sqrt(np.clip(var, 1e-8, None)).astype(np.float32)
+
+        self.mean_pose = mean          # [J, 3]
+        self.std = std                 # [J, 3]
+
+        # Cache to disk so subsequent runs skip recompute
+        stats = {"mean_pose": self.mean_pose, "std": self.std}
+        stats_path = os.path.join(self.cache_dir, f"stats_{self.cache_id}.pkl")
+        with open(stats_path, "wb") as f:
+            pickle.dump(stats, f)
     
     def _load_or_compute_dataset(self, force_recompute: bool = False) -> None:
         """Load dataset from cache if available, otherwise compute and cache it"""
@@ -484,53 +501,51 @@ class CMUMotionDataset(Dataset):
         """
         file_path, start_frame = self.windows[idx]
         motion_data = self.motion_data[file_path]
-        
         end_frame = start_frame + self.window_size
-        
-        # 1. Get pre-computed local positions (global transforms already removed)
-        local_positions = motion_data["local_positions"][start_frame:end_frame].copy()
-        
-        # Align original positions to the same window and align displacement
+
+        # 1) Local positions (global XZ translation + Y rotation already removed)
+        local_positions = motion_data["local_positions"][start_frame:end_frame].copy()  # [T,J,3]
+
+        # Align original positions for visualization convenience
         original_positions = motion_data["positions"][start_frame:end_frame].copy()
         original_positions[:, :, 0] -= original_positions[:1, :1, 0]
         original_positions[:, :, 2] -= original_positions[:1, :1, 2]
-        
-        # 2. Get global motion parameters for reconstruction
-        trans_vel_xz = motion_data["trans_vel_xz"][start_frame:end_frame].copy()
-        rot_vel_y = motion_data["rot_vel_y"][start_frame:end_frame].copy()
-        
-        # 3. TODO: Apply normalization to necessary part of the motion data to compute positions_normalized.
-        positions_normalized = None
-        
-        # 4. Create flat versions for the model
-        # Reshape: [time, joints, 3] -> [time, joints*3]
+
+        # 2) Global motion params (per-frame velocities)
+        trans_vel_xz = motion_data["trans_vel_xz"][start_frame:end_frame].copy()  # [T,2]
+        rot_vel_y    = motion_data["rot_vel_y"][start_frame:end_frame].copy()     # [T]
+
+        # 3) --- NORMALIZATION ---
+        # Broadcast mean/std [J,3] over time [T,J,3]
+        eps = 1e-8
+        positions_normalized = (local_positions - self.mean_pose[None, :, :]) / (self.std[None, :, :] + eps)
+
+        # 4) Flatten time×(J*3) views for models using [T,F]
         time_steps, joints, dims = local_positions.shape
         positions_flat = local_positions.reshape(time_steps, -1)
         positions_normalized_flat = positions_normalized.reshape(time_steps, -1)
-        
-        # 5. Create result dictionary
+
+        # 5) Package tensors
         result = {
-            "positions": torch.tensor(local_positions, dtype=torch.float32),
-            "positions_normalized": torch.tensor(positions_normalized, dtype=torch.float32),
-            "positions_flat": torch.tensor(positions_flat, dtype=torch.float32),
+            "positions": torch.tensor(local_positions, dtype=torch.float32),                 # [T,J,3]
+            "positions_normalized": torch.tensor(positions_normalized, dtype=torch.float32), # [T,J,3]
+            "positions_flat": torch.tensor(positions_flat, dtype=torch.float32),             # [T,F]
             "positions_normalized_flat": torch.tensor(positions_normalized_flat, dtype=torch.float32),
-            "trans_vel_xz": torch.tensor(trans_vel_xz, dtype=torch.float32),
-            "rot_vel_y": torch.tensor(rot_vel_y, dtype=torch.float32),
+            "trans_vel_xz": torch.tensor(trans_vel_xz, dtype=torch.float32),                 # [T,2]
+            "rot_vel_y": torch.tensor(rot_vel_y, dtype=torch.float32),                       # [T]
             "root_positions": torch.tensor(motion_data["positions"][start_frame:end_frame, 0, :], dtype=torch.float32),
-            "original_positions": torch.tensor(original_positions, dtype=torch.float32)
+            "original_positions": torch.tensor(original_positions, dtype=torch.float32),
         }
-        
-        # 6. Add additional data if available
-        # Add foot contacts if available
+
+        # 6) Optional extras
         if self.include_foot_contact and "foot_contacts" in motion_data:
-            foot_contacts = motion_data["foot_contacts"][start_frame:end_frame]
-            result["foot_contacts"] = torch.tensor(foot_contacts, dtype=torch.float32)
-        
-        # Add velocities if available
+            result["foot_contacts"] = torch.tensor(
+                motion_data["foot_contacts"][start_frame:end_frame], dtype=torch.float32
+            )
         if self.include_velocity and "velocities" in motion_data:
-            velocities = motion_data["velocities"][start_frame:end_frame]
-            result["velocities"] = torch.tensor(velocities, dtype=torch.float32)
-        
+            result["velocities"] = torch.tensor(
+                motion_data["velocities"][start_frame:end_frame], dtype=torch.float32
+            )
         return result
     
     def get_mean_pose(self):
