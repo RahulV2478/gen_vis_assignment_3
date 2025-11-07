@@ -221,7 +221,10 @@ class MotionManifoldTrainer:
                 x_pos = x[..., :posF]
                 xhat_pos = xhat[..., :posF]
                 loss_rec = crit(xhat_pos, x_pos)
-                loss_vel = crit(xhat_pos[:,1:] - xhat_pos[:,:-1], x_pos[:,1:] - x_pos[:,:-1])
+                loss_vel = crit(
+                    xhat_pos[:,1:] - xhat_pos[:,:-1],
+                    x_pos[:,1:]  - x_pos[:,:-1]
+                )
                 loss_spr = torch.mean(torch.abs(z))
                 loss = loss_rec + vel_w * loss_vel + sparsity_weight * loss_spr
                 opt.zero_grad(); loss.backward(); opt.step()
